@@ -1,13 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 /**
- * useMediaStream - hook to manage webcam/microphone stream - 
+ * useMediaStream - hook to manage webcam/microphone stream -
  *  - Accessing user media (camera/mic)
  *  - Starting/stopping the stream
  *  - Capturing frames from a video element
  *  - Creating MediaRecorder for recording
  *  - Handles errors and cleanup
- * 
+ *
  */
 
 type StartConstraints = MediaStreamConstraints;

@@ -21,7 +21,10 @@ export const useDetectWorker = (workerUrl: string) => {
   // Worker initialization
   useEffect(() => {
     try {
-      workerRef.current = new Worker(workerUrl, { type: "module" });
+      workerRef.current = new Worker(
+        new URL("../worker/detectWorker.ts", import.meta.url),
+        { type: "module" }
+      );
 
       workerRef.current.onmessage = (event: MessageEvent<WorkerMessage>) => {
         const data = event.data;

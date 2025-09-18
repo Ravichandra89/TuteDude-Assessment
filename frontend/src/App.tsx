@@ -1,10 +1,28 @@
 import React from "react";
+import {
+  BrowserRouter as Router,
+  Routes,
+  Route,
+  Navigate,
+} from "react-router-dom";
 
-const App = () => {
+import InterviewPage from "./pages/InterviewPage";
+import LandingPage from "./pages/LandingPage";
+
+const App: React.FC = () => {
   return (
-    <div>
-      <p className="text-6xl">Hello Welcome to Interview-Buddy</p>
-    </div>
+    <Router>
+      <Routes>
+        {/* Landing page with role selection */}
+        <Route path="/" element={<LandingPage />} />
+
+        {/* Interview page with role query */}
+        <Route path="/interview" element={<InterviewPage />} />
+
+        {/* Catch-all fallback */}
+        <Route path="*" element={<Navigate to="/" replace />} />
+      </Routes>
+    </Router>
   );
 };
 
