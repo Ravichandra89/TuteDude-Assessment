@@ -1,21 +1,25 @@
 import { Server as HttpServer } from "http";
 import { Server as SocketIOServer, Socket } from "socket.io";
-import { SignalingEvents } from "./events";
 import logger from "../utils/logger";
 
-/**
- * Initialize Socket.IO signaling server.
- * - Allows clients to join a room (roomId can be sessionId).
- * - Relays offer/answer/ice-candidate messages to other participants in the room.
- * - Emits READY when someone joins so client can know when to createOffer.
- *
- * Usage:
- *   const io = initSignaling(httpServer);
- *
- * Notes:
- *  - This is a simple relay-style signaling server. Media does not traverse this server.
- *  - Room semantics: multiple participants allowed but for 1:1 interviews typically two participants join.
- */
+export const SignalingEvents = {
+  JOIN: "join",
+  LEAVE: "leave",
+  READY: "ready",
+  OFFER: "offer",
+  ANSWER: "answer",
+  ICE_CANDIDATE: "ice-candidate",
+  PARTICIPANT_LEFT: "participant-left",
+  ERROR: "error",
+};
+
+type RoomUser = {
+  id: string;
+  role: "interviewer" | "candidate";
+};
+
+const rooms: Record<string, RoomUser[]> = {};
+
 export const initSignaling = (server: HttpServer) => {
   const io = new SocketIOServer(server, {
     cors: { origin: "*", methods: ["GET", "POST"] },
@@ -23,153 +27,136 @@ export const initSignaling = (server: HttpServer) => {
   });
 
   io.on("connection", (socket: Socket) => {
-    logger.info("Signaling: socket connected", socket.id);
+    logger.info("Signaling: socket connected " + socket.id);
 
-    // Handler: join room
+    // --- JOIN ROOM ---
+    // --- JOIN ROOM ---
     socket.on(
       SignalingEvents.JOIN,
-      (payload: { roomId?: string; role?: string }) => {
+      ({
+        roomId,
+        role,
+      }: {
+        roomId?: string;
+        role?: "interviewer" | "candidate";
+      }) => {
         try {
-          const roomId = payload?.roomId;
-          if (!roomId) {
+          if (!roomId || !role) {
             socket.emit(SignalingEvents.ERROR, {
-              message: "roomId required to join",
+              message: "roomId & role required",
             });
             return;
           }
 
           socket.join(roomId);
           socket.data.roomId = roomId;
-          socket.data.role = payload.role || "participant";
+          socket.data.role = role;
+
+          if (!rooms[roomId]) rooms[roomId] = [];
+          rooms[roomId].push({ id: socket.id, role });
+
           logger.info(
-            `Socket ${socket.id} joined room ${roomId} as ${socket.data.role}`
+            `Socket ${
+              socket.id
+            } joined room ${roomId} as **${role.toUpperCase()}**`
           );
 
-          // Notify other participants in the room that someone joined (so they might start negotiation)
-          socket
-            .to(roomId)
-            .emit(SignalingEvents.READY, {
-              socketId: socket.id,
-              role: socket.data.role,
+          // Notify others in room about new participant
+          socket.to(roomId).emit("participant-joined", {
+            id: socket.id,
+            role,
+          });
+
+          // If both interviewer and candidate are present → notify READY
+          const hasInterviewer = rooms[roomId].some(
+            (u) => u.role === "interviewer"
+          );
+          const hasCandidate = rooms[roomId].some(
+            (u) => u.role === "candidate"
+          );
+
+          if (hasInterviewer && hasCandidate) {
+            io.to(roomId).emit(SignalingEvents.READY, {
+              roomId,
+              participants: rooms[roomId],
             });
+            logger.info(
+              `[READY] Room ${roomId} has interviewer + candidate. Starting handshake.`
+            );
+          }
         } catch (err) {
-          logger.error("Signaling JOIN error", err);
+          logger.error("JOIN error", err);
           socket.emit(SignalingEvents.ERROR, { message: "Join failed" });
         }
       }
     );
 
-    // Handler: leave room
-    socket.on(SignalingEvents.LEAVE, (payload: { roomId?: string }) => {
-      try {
-        const roomId = payload?.roomId || socket.data.roomId;
-        if (roomId) {
-          socket.leave(roomId);
-          logger.info(`Socket ${socket.id} left room ${roomId}`);
-          socket
-            .to(roomId)
-            .emit(SignalingEvents.PARTICIPANT_LEFT, { socketId: socket.id });
-        }
-      } catch (err) {
-        logger.error("Signaling LEAVE error", err);
+    // --- LEAVE ROOM ---
+    socket.on(SignalingEvents.LEAVE, () => {
+      const roomId = socket.data.roomId;
+      if (roomId) {
+        socket.leave(roomId);
+        rooms[roomId] = (rooms[roomId] || []).filter((u) => u.id !== socket.id);
+
+        socket.to(roomId).emit(SignalingEvents.PARTICIPANT_LEFT, {
+          socketId: socket.id,
+        });
+        logger.info(`Socket ${socket.id} left room ${roomId}`);
       }
     });
 
-    // Handler: offer
-    socket.on(
-      SignalingEvents.OFFER,
-      (payload: { roomId?: string; description?: any }) => {
-        try {
-          const roomId = payload?.roomId || socket.data.roomId;
-          if (!roomId || !payload?.description) {
-            socket.emit(SignalingEvents.ERROR, {
-              message: "offer requires roomId and description",
-            });
-            return;
-          }
-          // Relay offer to others in the room
-          socket
-            .to(roomId)
-            .emit(SignalingEvents.OFFER, {
-              description: payload.description,
-              from: socket.id,
-            });
-          logger.info(`Relayed OFFER from ${socket.id} to room ${roomId}`);
-        } catch (err) {
-          logger.error("Signaling OFFER error", err);
-          socket.emit(SignalingEvents.ERROR, { message: "Offer relay failed" });
-        }
+    // --- OFFER ---
+    socket.on(SignalingEvents.OFFER, ({ roomId, description }) => {
+      if (!roomId || !description) {
+        socket.emit(SignalingEvents.ERROR, {
+          message: "Offer requires roomId & description",
+        });
+        return;
       }
-    );
+      socket
+        .to(roomId)
+        .emit(SignalingEvents.OFFER, { description, from: socket.id });
+      logger.info(`Relayed OFFER from ${socket.id} to room ${roomId}`);
+    });
 
-    // Handler: answer
-    socket.on(
-      SignalingEvents.ANSWER,
-      (payload: { roomId?: string; description?: any }) => {
-        try {
-          const roomId = payload?.roomId || socket.data.roomId;
-          if (!roomId || !payload?.description) {
-            socket.emit(SignalingEvents.ERROR, {
-              message: "answer requires roomId and description",
-            });
-            return;
-          }
-          socket
-            .to(roomId)
-            .emit(SignalingEvents.ANSWER, {
-              description: payload.description,
-              from: socket.id,
-            });
-          logger.info(`Relayed ANSWER from ${socket.id} to room ${roomId}`);
-        } catch (err) {
-          logger.error("Signaling ANSWER error", err);
-          socket.emit(SignalingEvents.ERROR, {
-            message: "Answer relay failed",
-          });
-        }
+    // --- ANSWER ---
+    socket.on(SignalingEvents.ANSWER, ({ roomId, description }) => {
+      if (!roomId || !description) {
+        socket.emit(SignalingEvents.ERROR, {
+          message: "Answer requires roomId & description",
+        });
+        return;
       }
-    );
+      socket
+        .to(roomId)
+        .emit(SignalingEvents.ANSWER, { description, from: socket.id });
+      logger.info(`Relayed ANSWER from ${socket.id} to room ${roomId}`);
+    });
 
-    // Handler: ice-candidate
-    socket.on(
-      SignalingEvents.ICE_CANDIDATE,
-      (payload: { roomId?: string; candidate?: any }) => {
-        try {
-          const roomId = payload?.roomId || socket.data.roomId;
-          if (!roomId || !payload?.candidate) {
-            socket.emit(SignalingEvents.ERROR, {
-              message: "ice-candidate requires roomId and candidate",
-            });
-            return;
-          }
-          socket
-            .to(roomId)
-            .emit(SignalingEvents.ICE_CANDIDATE, {
-              candidate: payload.candidate,
-              from: socket.id,
-            });
-          // ICE candidates are frequent: avoid excessive logging in high-volume scenarios
-        } catch (err) {
-          logger.error("Signaling ICE_CANDIDATE error", err);
-          socket.emit(SignalingEvents.ERROR, {
-            message: "ICE candidate relay failed",
-          });
-        }
+    // --- ICE CANDIDATE ---
+    socket.on(SignalingEvents.ICE_CANDIDATE, ({ roomId, candidate }) => {
+      if (!roomId || !candidate) {
+        socket.emit(SignalingEvents.ERROR, {
+          message: "ICE candidate requires roomId & candidate",
+        });
+        return;
       }
-    );
+      socket
+        .to(roomId)
+        .emit(SignalingEvents.ICE_CANDIDATE, { candidate, from: socket.id });
+    });
 
-    // When client disconnects, inform room participants
+    // --- DISCONNECT ---
     socket.on("disconnect", (reason) => {
-      try {
-        const roomId = socket.data.roomId;
-        logger.info(`Socket disconnected ${socket.id} reason=${reason}`);
-        if (roomId) {
-          socket
-            .to(roomId)
-            .emit(SignalingEvents.PARTICIPANT_LEFT, { socketId: socket.id });
-        }
-      } catch (err) {
-        logger.error("Signaling disconnect error", err);
+      const roomId = socket.data.roomId;
+      logger.info(`Socket disconnected ${socket.id}, reason=${reason}`);
+
+      if (roomId) {
+        rooms[roomId] = (rooms[roomId] || []).filter((u) => u.id !== socket.id);
+
+        socket.to(roomId).emit(SignalingEvents.PARTICIPANT_LEFT, {
+          socketId: socket.id,
+        });
       }
     });
   });
