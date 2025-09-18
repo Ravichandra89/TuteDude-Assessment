@@ -1,3 +1,4 @@
+// src/hooks/useWebRTC.ts
 import { useState, useRef } from "react";
 import { io, Socket } from "socket.io-client";
 
@@ -5,6 +6,7 @@ export type Role = "candidate" | "interviewer";
 type RemoteStreams = Record<string, MediaStream>;
 
 interface ServerEvents {
+  ready: { participants: Array<string | { id: string; role?: string }> };
   offer: { from: string; offer: RTCSessionDescriptionInit };
   answer: { from: string; answer: RTCSessionDescriptionInit };
   "ice-candidate": { from: string; candidate: RTCIceCandidateInit };
@@ -19,70 +21,95 @@ export const useWebRTC = () => {
   const localStreamRef = useRef<MediaStream | null>(null);
   const socket = useRef<Socket | null>(null);
 
+  /** 🔌 Connect signaling socket */
   const connectSocket = () => {
-    if (!socket.current) {
-      socket.current = io("http://localhost:4000");
+    if (socket.current) return;
 
-      // Offer received (candidate)
-      socket.current.on(
-        "offer",
-        async ({ from, offer }: ServerEvents["offer"]) => {
-          console.log("[useWebRTC] Received offer from", from);
+    socket.current = io("http://localhost:4000");
 
-          const pc = createPeerConnection(from);
-          await pc.setRemoteDescription(offer);
-          addLocalTracks(pc);
+    /** 📩 Offer received → candidate side */
+    socket.current.on(
+      "offer",
+      async ({ from, offer }: ServerEvents["offer"]) => {
+        console.log("[useWebRTC] Received offer from", from);
 
-          const answer = await pc.createAnswer();
-          await pc.setLocalDescription(answer);
+        const pc = createPeerConnection(from);
 
-          socket.current?.emit("answer", { to: from, answer });
+        // ✅ add local tracks before answering
+        addLocalTracks(pc);
+
+        await pc.setRemoteDescription(new RTCSessionDescription(offer));
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+
+        socket.current?.emit("answer", { to: from, answer });
+        console.log("[useWebRTC] Sent answer to", from);
+      }
+    );
+
+    /** 📩 Answer received → interviewer side */
+    socket.current.on(
+      "answer",
+      async ({ from, answer }: ServerEvents["answer"]) => {
+        const pc = pcs.current[from];
+        if (pc) {
+          await pc.setRemoteDescription(new RTCSessionDescription(answer));
+          console.log("[useWebRTC] Set remote description from answer", from);
+        } else {
+          console.warn("[useWebRTC] Received answer but no pc found for", from);
         }
-      );
+      }
+    );
 
-      // Answer received (interviewer)
-      socket.current.on(
-        "answer",
-        async ({ from, answer }: ServerEvents["answer"]) => {
-          const pc = pcs.current[from];
-          if (pc) {
-            await pc.setRemoteDescription(answer);
+    /** 📩 ICE candidate received */
+    socket.current.on(
+      "ice-candidate",
+      async ({ from, candidate }: ServerEvents["ice-candidate"]) => {
+        const pc = pcs.current[from];
+        if (pc && candidate) {
+          try {
+            await pc.addIceCandidate(new RTCIceCandidate(candidate));
+            console.log("[useWebRTC] Added ICE candidate from", from);
+          } catch (err) {
+            console.error("Error adding ICE candidate", err);
           }
+        } else {
+          console.warn(
+            "[useWebRTC] ICE candidate received but no pc for",
+            from
+          );
         }
-      );
+      }
+    );
 
-      // ICE candidate received
-      socket.current.on(
-        "ice-candidate",
-        async ({ from, candidate }: ServerEvents["ice-candidate"]) => {
-          const pc = pcs.current[from];
-          if (pc && candidate) {
-            await pc.addIceCandidate(candidate);
-          }
-        }
-      );
-
-      // Participant left
-      socket.current.on(
-        "participant-left",
-        ({ id }: ServerEvents["participant-left"]) => {
+    /** 👋 Peer left */
+    socket.current.on(
+      "participant-left",
+      ({ id }: ServerEvents["participant-left"]) => {
+        console.log("[useWebRTC] Peer left:", id);
+        if (pcs.current[id]) {
+          pcs.current[id].close();
           delete pcs.current[id];
-          setRemoteStreams((prev) => {
-            const newStreams = { ...prev };
-            delete newStreams[id];
-            return newStreams;
-          });
         }
-      );
-    }
+        setRemoteStreams((prev) => {
+          const copy = { ...prev };
+          delete copy[id];
+          return copy;
+        });
+      }
+    );
   };
 
+  /** 🛠️ Create PeerConnection (with STUN) */
   const createPeerConnection = (id: string) => {
-    const pc = new RTCPeerConnection();
+    // Add a public STUN server for better NAT traversal (keeps logic intact)
+    const pc = new RTCPeerConnection({
+      iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+    });
     pcs.current[id] = pc;
 
     pc.ontrack = (event) => {
-      console.log("🔊 Remote track received from", id, event.streams[0]);
+      console.log("🎥 Remote track received from", id, event.streams[0]);
       setRemoteStreams((prev) => ({ ...prev, [id]: event.streams[0] }));
     };
 
@@ -92,20 +119,26 @@ export const useWebRTC = () => {
           to: id,
           candidate: event.candidate,
         });
+        console.log("[useWebRTC] Emitted ICE candidate to", id);
       }
     };
 
     return pc;
   };
 
+  /** ➕ Add all local tracks */
   const addLocalTracks = (pc: RTCPeerConnection) => {
-    if (localStreamRef.current) {
-      localStreamRef.current
-        .getTracks()
-        .forEach((track) => pc.addTrack(track, localStreamRef.current!));
+    if (!localStreamRef.current) {
+      console.warn("[useWebRTC] No localStreamRef when trying to add tracks");
+      return;
     }
+    localStreamRef.current.getTracks().forEach((track) => {
+      pc.addTrack(track, localStreamRef.current!);
+      console.log("[useWebRTC] Added local track:", track.kind);
+    });
   };
 
+  /** 🚀 Start connection */
   const startConnection = async (
     roomId: string,
     role: Role,
@@ -116,23 +149,50 @@ export const useWebRTC = () => {
 
     socket.current?.emit("join", { roomId, role });
 
-    // Wait a short time for the other participant to join
-    await new Promise((res) => setTimeout(res, 500));
-
     if (role === "interviewer") {
-      const otherId = "candidate"; // simple one-to-one mapping
-      const pc = createPeerConnection(otherId);
-      addLocalTracks(pc);
+      // interviewer creates the offer
+      socket.current?.once(
+        "ready",
+        async ({
+          participants,
+        }: {
+          participants: Array<string | { id: string; role?: string }>;
+        }) => {
+          // Normalize participants to IDs (handle server returning objects or strings)
+          const myId = socket.current?.id;
+          const ids = participants.map((p) =>
+            typeof p === "string" ? p : p.id
+          );
+          const others = ids.filter((pId) => pId !== myId);
+          if (others.length === 0) {
+            console.log(
+              "[useWebRTC] No other participants found in ready list"
+            );
+            return;
+          }
 
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
+          const peerId = others[0];
+          console.log("[useWebRTC] Interviewer found candidate:", peerId);
 
-      socket.current?.emit("offer", { to: otherId, offer });
+          const pc = createPeerConnection(peerId);
+
+          // ✅ add tracks before creating offer
+          addLocalTracks(pc);
+
+          const offer = await pc.createOffer();
+          await pc.setLocalDescription(offer);
+
+          // Ensure 'to' is a plain ID string
+          socket.current?.emit("offer", { to: peerId, offer });
+          console.log("[useWebRTC] Sent offer to", peerId);
+        }
+      );
     }
 
     setIsConnected(true);
   };
 
+  /** ❌ Close everything */
   const closeConnection = () => {
     Object.values(pcs.current).forEach((pc) => pc.close());
     pcs.current = {};
