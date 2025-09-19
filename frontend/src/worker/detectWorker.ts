@@ -1,10 +1,9 @@
 /// <reference lib="webworker" />
 import * as faceLandmarksDetection from "@tensorflow-models/face-landmarks-detection";
-import * as cocoSsd from "@tensorflow-models/coco-ssd";
-import "@tensorflow/tfjs";
+import "@tensorflow/tfjs-backend-wasm"; // WASM backend for worker
 
 type WorkerInputMessage = { type: "analyze-frame"; frame: ImageBitmap };
-type DetectionPayloadType = "focus" | "no-face" | "multi-face" | "object";
+type DetectionPayloadType = "focus" | "no-face" | "multi-face";
 
 interface DetectionPayload {
   type: DetectionPayloadType;
@@ -13,52 +12,41 @@ interface DetectionPayload {
 }
 
 let faceModel: faceLandmarksDetection.FaceLandmarksDetector | null = null;
-let objectModel: cocoSsd.ObjectDetection | null = null;
 
 let lastFocusTs = 0;
 let lastFaceTs = 0;
 let lastMultiFaceTs = 0;
-let lastObjectTs = 0;
 
 const FOCUS_TIMEOUT = 5000;
 const NO_FACE_TIMEOUT = 10000;
 const MULTI_FACE_TIMEOUT = 5000;
-const OBJECT_TIMEOUT = 5000;
 const FOCUS_THRESHOLD = 0.25;
 
 const violationCounts: Record<DetectionPayloadType, number> = {
   focus: 0,
   "no-face": 0,
   "multi-face": 0,
-  object: 0,
 };
 
+// Initialize the face landmarks detector
 const initModels = async () => {
   if (!faceModel) {
     faceModel = await faceLandmarksDetection.createDetector(
       faceLandmarksDetection.SupportedModels.MediaPipeFaceMesh,
-      { runtime: "tfjs", refineLandmarks: true }
+      { runtime: "tfjs", refineLandmarks: true } // tfjs runtime works in worker
     );
   }
-  if (!objectModel) objectModel = await cocoSsd.load();
 };
 
+// Analyze a single ImageBitmap frame
 const analyzeFrame = async (frame: ImageBitmap) => {
   try {
     await initModels();
-
-    const canvas = new OffscreenCanvas(frame.width, frame.height);
-    const ctx = canvas.getContext("2d");
-    if (!ctx) throw new Error("Failed to get OffscreenCanvas context");
-
-    ctx.drawImage(frame, 0, 0);
-    const imageData = ctx.getImageData(0, 0, frame.width, frame.height);
     const now = Date.now();
-
     const eventsToSend: DetectionPayload[] = [];
 
-    // --- FACE DETECTION ---
-    const faces = faceModel ? await faceModel.estimateFaces(imageData) : [];
+    // Face detection
+    const faces = faceModel ? await faceModel.estimateFaces(frame) : [];
 
     if (!faces || faces.length === 0) {
       if (now - lastFaceTs > NO_FACE_TIMEOUT) {
@@ -99,32 +87,12 @@ const analyzeFrame = async (frame: ImageBitmap) => {
       } else if (nose) lastFocusTs = now;
     }
 
-    // --- OBJECT DETECTION ---
-    if (objectModel && now - lastObjectTs > OBJECT_TIMEOUT) {
-      const predictions = await objectModel.detect(
-        canvas as unknown as HTMLCanvasElement
-      );
-      const objDetected = predictions.filter((p) =>
-        ["cell phone", "book", "laptop"].includes(p.class)
-      );
-      if (objDetected.length > 0) {
-        objDetected.forEach((p) => {
-          eventsToSend.push({
-            type: "object",
-            message: `${p.class} detected`,
-            timestamp: now,
-          });
-          violationCounts.object += 1;
-        });
-        lastObjectTs = now;
-      }
-    }
-
-    // Send all events at once
+    // Send all detected events to main thread
     eventsToSend.forEach((evt) =>
       postMessage({ type: "detection", payload: evt })
     );
 
+    // Release the ImageBitmap
     frame.close?.();
   } catch (err: unknown) {
     postMessage({
@@ -134,6 +102,7 @@ const analyzeFrame = async (frame: ImageBitmap) => {
   }
 };
 
+// Listen to messages from the main thread
 self.onmessage = async (
   event: MessageEvent<WorkerInputMessage | { type: "get-report" }>
 ) => {

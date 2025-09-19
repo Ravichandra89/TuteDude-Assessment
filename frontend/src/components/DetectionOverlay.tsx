@@ -1,7 +1,6 @@
 import React, { useEffect, useRef } from "react";
-import type { DetectionEvent as BaseDetectionEvent } from "../hooks/useDetectWorker";
+import type { DetectionEvent as BaseDetectionEvent } from "../hooks/useDetection";
 
-// Extend DetectionEvent to optionally include bbox for object detection
 export interface DetectionEvent extends BaseDetectionEvent {
   bbox?: { x: number; y: number; width: number; height: number };
 }
@@ -9,7 +8,7 @@ export interface DetectionEvent extends BaseDetectionEvent {
 interface DetectionOverlayProps {
   videoRef: React.RefObject<HTMLVideoElement | null>;
   events: DetectionEvent[];
-  onDetect?: (evt: DetectionEvent) => void; // <-- add this
+  onDetect?: (evt: DetectionEvent) => void;
 }
 
 const DetectionOverlay: React.FC<DetectionOverlayProps> = ({
@@ -35,7 +34,6 @@ const DetectionOverlay: React.FC<DetectionOverlayProps> = ({
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
-    // Match canvas size to video
     const resizeCanvas = () => {
       if (video.videoWidth && video.videoHeight) {
         canvas.width = video.videoWidth;
@@ -44,10 +42,8 @@ const DetectionOverlay: React.FC<DetectionOverlayProps> = ({
     };
     resizeCanvas();
 
-    // Clear + redraw overlay every time events update
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-    // Draw bounding boxes for object detection
     events.forEach((evt) => {
       if (evt.type === "object" && evt.bbox) {
         const { x, y, width, height } = evt.bbox;
@@ -65,7 +61,6 @@ const DetectionOverlay: React.FC<DetectionOverlayProps> = ({
   return (
     <div className="absolute inset-0 pointer-events-none">
       <canvas ref={canvasRef} className="w-full h-full" />
-
       <div className="absolute top-2 left-1/2 -translate-x-1/2 space-y-2">
         {events.map((evt, idx) => {
           if (["focus", "no-face", "multi-face"].includes(evt.type)) {

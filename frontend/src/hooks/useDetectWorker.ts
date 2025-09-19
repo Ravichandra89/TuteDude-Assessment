@@ -7,92 +7,89 @@ export type DetectionEvent = {
   timestamp: number;
 };
 
-export type DetectionReport = Record<DetectionEvent["type"], number>;
-
-type WorkerMessage =
-  | { type: "detection"; payload: DetectionEvent }
-  | { type: "error"; error: string }
-  | { type: "report"; payload: DetectionReport };
-
-export const useDetectWorker = (workerUrl: string) => {
+export const useDetectWorker = (
+  workerUrl: string,
+  onEvent?: (evt: DetectionEvent) => void
+) => {
   const workerRef = useRef<Worker | null>(null);
   const [events, setEvents] = useState<DetectionEvent[]>([]);
-  const [isRunning, setIsRunning] = useState(false);
-
+  const isRunningRef = useRef(false);
   const { logEvent } = useEventLogger();
 
-  // Initialize worker
   useEffect(() => {
     const worker = new Worker(workerUrl, { type: "module" });
     workerRef.current = worker;
 
-    worker.onmessage = (event: MessageEvent<WorkerMessage>) => {
+    worker.onmessage = (event: MessageEvent<any>) => {
       const data = event.data;
-
       if (data.type === "detection") {
         setEvents((prev) => [...prev, data.payload]);
         logEvent(data.payload.type.toUpperCase(), data.payload.message, {
           timestamp: data.payload.timestamp,
         });
+        if (onEvent) onEvent(data.payload);
       } else if (data.type === "error") {
         console.error("[DetectWorker] Error:", data.error);
       }
     };
 
-    worker.onerror = (err) => {
+    worker.onerror = (err) =>
       console.error("[DetectWorker] Worker runtime error:", err);
-    };
 
     return () => {
       workerRef.current?.terminate();
       workerRef.current = null;
     };
-  }, [workerUrl, logEvent]);
+  }, [workerUrl, logEvent, onEvent]);
 
-  // Send a video frame to worker for analysis
   const analyzeFrame = useCallback((frame: ImageBitmap) => {
-    workerRef.current?.postMessage({ type: "analyze-frame", frame });
+    const worker = workerRef.current;
+    if (!worker) return;
+    worker.postMessage({ type: "analyze-frame", frame }, [frame]);
   }, []);
 
-  // Detection loop
   const startDetection = useCallback(
-    (video: HTMLVideoElement) => {
-      if (!video) return;
-      setIsRunning(true);
+    (video: HTMLVideoElement | null, fps = 6) => {
+      if (!video || !workerRef.current) return;
+      if (isRunningRef.current) return;
+      isRunningRef.current = true;
 
-      const loop = async () => {
-        if (!isRunning) return;
+      const intervalMs = Math.round(1000 / fps);
+      let lastTime = 0;
 
-        const worker = workerRef.current; // copy reference
-        if (!worker) return;
+      const loop = async (now?: number) => {
+        if (!isRunningRef.current) return;
 
-        try {
-          const frame = await createImageBitmap(video);
-          analyzeFrame(frame);
-        } catch (err) {
-          console.error("[DetectWorker] Frame capture error:", err);
+        if (!now || now - lastTime >= intervalMs) {
+          lastTime = now ?? Date.now();
+          try {
+            const frame = await createImageBitmap(video);
+            analyzeFrame(frame);
+          } catch (err) {
+            console.error("[DetectWorker] Frame capture error:", err);
+          }
         }
 
-        if (isRunning) requestAnimationFrame(loop);
+        requestAnimationFrame(loop);
       };
 
-      loop();
+      requestAnimationFrame(loop);
     },
-    [analyzeFrame, isRunning]
+    [analyzeFrame]
   );
 
-  // Stop detection
   const stopDetection = useCallback(() => {
-    setIsRunning(false);
+    isRunningRef.current = false;
   }, []);
 
-  // Get cumulative report from worker
-  const getReport = useCallback(async (): Promise<DetectionReport | null> => {
+  const getReport = useCallback(async (): Promise<Record<
+    string,
+    number
+  > | null> => {
     const worker = workerRef.current;
     if (!worker) return null;
-
     return new Promise((resolve) => {
-      const handler = (event: MessageEvent<WorkerMessage>) => {
+      const handler = (event: MessageEvent<any>) => {
         if (event.data.type === "report") {
           resolve(event.data.payload);
           worker.removeEventListener("message", handler);
@@ -105,11 +102,10 @@ export const useDetectWorker = (workerUrl: string) => {
 
   return {
     events,
-    isRunning,
+    isRunning: () => isRunningRef.current,
     startDetection,
     stopDetection,
     getReport,
+    _worker: workerRef.current,
   };
 };
-
-export default useDetectWorker;
