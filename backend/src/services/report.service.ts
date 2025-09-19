@@ -1,51 +1,83 @@
+// src/services/report.service.ts
 import PDFDocument from "pdfkit";
-import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
-import s3 from "../config/s3";  // <-- use the default export
-import { Readable } from "stream";
+import fs from "fs";
+import path from "path";
 
-export const generatePDFReport = async (reportData: any, sessionId: string): Promise<string> => {
-  try {
-    const doc = new PDFDocument();
-    const buffers: Buffer[] = [];
+interface ReportData {
+  candidateName?: string;
+  interviewDuration?: number | null;
+  focusLostCount?: number;
+  absenceCount?: number;
+  multipleFacesCount?: number;
+  suspiciousItems?: string[];
+  events?: any[];
+  integrityScore?: number;
+}
 
-    doc.on("data", buffers.push.bind(buffers));
+export const generatePDFReport = async (
+  reportData: ReportData,
+  sessionId: string
+): Promise<string> => {
+  return new Promise((resolve, reject) => {
+    try {
+      // Ensure events array exists
+      const events = reportData.events || [];
 
-    // Generate PDF content
-    doc.fontSize(18).text("Proctoring Report", { align: "center" });
-    doc.moveDown();
-    doc.fontSize(12).text(`Candidate: ${reportData.candidateName}`);
-    doc.text(`Integrity Score: ${reportData.integrityScore}`);
-    doc.text(`Focus Lost: ${reportData.focusLostCount}`);
-    doc.text(`Absence Count: ${reportData.absenceCount}`);
-    doc.text(`Multiple Faces: ${reportData.multipleFacesCount}`);
-    doc.moveDown();
-    doc.text("Suspicious Items:");
-    reportData.suspiciousItems.forEach((item: string, i: number) => {
-      doc.text(`${i + 1}. ${item}`);
-    });
+      // Temporary folder for PDFs
+      const tmpDir = path.resolve(__dirname, "../../tmp");
+      if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
 
-    doc.end();
+      // Output PDF path
+      const pdfPath = path.join(tmpDir, `${sessionId}.pdf`);
 
-    // Wait until PDF is finished
-    await new Promise<void>((resolve) => {
-      doc.on("end", () => resolve());
-    });
+      const doc = new PDFDocument({ size: "A4", margin: 50 });
+      const writeStream = fs.createWriteStream(pdfPath);
+      doc.pipe(writeStream);
 
-    const pdfBuffer = Buffer.concat(buffers);
+      // Header
+      doc.fontSize(20).text("Interview Proctoring Report", { align: "center" });
+      doc.moveDown();
 
-    // Upload to S3
-    await s3.send(
-      new PutObjectCommand({
-        Bucket: process.env.AWS_S3_BUCKET!,
-        Key: `reports/${sessionId}.pdf`,
-        Body: pdfBuffer,
-        ContentType: "application/pdf",
-      })
-    );
+      doc
+        .fontSize(14)
+        .text(`Candidate: ${reportData.candidateName || "Unknown"}`);
+      doc.text(
+        `Duration: ${
+          reportData.interviewDuration != null
+            ? `${reportData.interviewDuration} seconds`
+            : "N/A"
+        }`
+      );
+      doc.text(`Integrity Score: ${reportData.integrityScore ?? "N/A"}`);
+      doc.moveDown();
 
-    return `https://${process.env.AWS_S3_BUCKET}.s3.amazonaws.com/reports/${sessionId}.pdf`;
-  } catch (error) {
-    console.error("❌ Error generating PDF:", error);
-    return "";
-  }
+      // Event Summary
+      doc.fontSize(16).text("Event Summary:");
+      if (events.length === 0) {
+        doc.fontSize(12).text("No events recorded.");
+      } else {
+        events.forEach((e, idx) => {
+          doc
+            .fontSize(12)
+            .text(
+              `${idx + 1}. [${e.type || "UNKNOWN"}] ${
+                e.message || ""
+              } - ${new Date(e.timestamp).toLocaleString()}`
+            );
+        });
+      }
+
+      doc.end();
+
+      writeStream.on("finish", () => {
+        resolve(pdfPath); // Return full path
+      });
+
+      writeStream.on("error", (err) => {
+        reject(err);
+      });
+    } catch (err) {
+      reject(err);
+    }
+  });
 };

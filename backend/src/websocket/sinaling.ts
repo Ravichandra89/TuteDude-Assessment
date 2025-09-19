@@ -13,9 +13,11 @@ export const SignalingEvents = {
   ERROR: "error",
 };
 
+type Role = "interviewer" | "candidate";
+
 type RoomUser = {
   id: string;
-  role: "interviewer" | "candidate";
+  role: Role;
 };
 
 const rooms: Record<string, RoomUser[]> = {};
@@ -30,16 +32,9 @@ export const initSignaling = (server: HttpServer) => {
     logger.info("Signaling: socket connected " + socket.id);
 
     // --- JOIN ROOM ---
-    // --- JOIN ROOM ---
     socket.on(
       SignalingEvents.JOIN,
-      ({
-        roomId,
-        role,
-      }: {
-        roomId?: string;
-        role?: "interviewer" | "candidate";
-      }) => {
+      ({ roomId, role }: { roomId?: string; role?: Role }) => {
         try {
           if (!roomId || !role) {
             socket.emit(SignalingEvents.ERROR, {
@@ -48,11 +43,32 @@ export const initSignaling = (server: HttpServer) => {
             return;
           }
 
+          if (!rooms[roomId]) rooms[roomId] = [];
+
+          // prevent >1 candidate or >1 interviewer
+          if (
+            rooms[roomId].some((u) => u.role === role) &&
+            role === "candidate"
+          ) {
+            socket.emit(SignalingEvents.ERROR, {
+              message: "Candidate already present in room",
+            });
+            return;
+          }
+          if (
+            rooms[roomId].some((u) => u.role === role) &&
+            role === "interviewer"
+          ) {
+            socket.emit(SignalingEvents.ERROR, {
+              message: "Interviewer already present in room",
+            });
+            return;
+          }
+
           socket.join(roomId);
           socket.data.roomId = roomId;
           socket.data.role = role;
 
-          if (!rooms[roomId]) rooms[roomId] = [];
           rooms[roomId].push({ id: socket.id, role });
 
           logger.info(
@@ -61,7 +77,7 @@ export const initSignaling = (server: HttpServer) => {
             } joined room ${roomId} as **${role.toUpperCase()}**`
           );
 
-          // Notify others in room about new participant
+          // notify other peer
           socket.to(roomId).emit("participant-joined", {
             id: socket.id,
             role,
@@ -99,51 +115,49 @@ export const initSignaling = (server: HttpServer) => {
         rooms[roomId] = (rooms[roomId] || []).filter((u) => u.id !== socket.id);
 
         socket.to(roomId).emit(SignalingEvents.PARTICIPANT_LEFT, {
-          socketId: socket.id,
+          id: socket.id,
         });
         logger.info(`Socket ${socket.id} left room ${roomId}`);
       }
     });
 
     // --- OFFER ---
-    socket.on(SignalingEvents.OFFER, ({ roomId, description }) => {
-      if (!roomId || !description) {
+    socket.on(SignalingEvents.OFFER, ({ to, offer }) => {
+      if (!to || !offer) {
         socket.emit(SignalingEvents.ERROR, {
-          message: "Offer requires roomId & description",
+          message: "Offer requires to & offer",
         });
         return;
       }
-      socket
-        .to(roomId)
-        .emit(SignalingEvents.OFFER, { description, from: socket.id });
-      logger.info(`Relayed OFFER from ${socket.id} to room ${roomId}`);
+      io.to(to).emit(SignalingEvents.OFFER, { from: socket.id, offer });
+      logger.info(`Relayed OFFER from ${socket.id} → ${to}`);
     });
 
     // --- ANSWER ---
-    socket.on(SignalingEvents.ANSWER, ({ roomId, description }) => {
-      if (!roomId || !description) {
+    socket.on(SignalingEvents.ANSWER, ({ to, answer }) => {
+      if (!to || !answer) {
         socket.emit(SignalingEvents.ERROR, {
-          message: "Answer requires roomId & description",
+          message: "Answer requires to & answer",
         });
         return;
       }
-      socket
-        .to(roomId)
-        .emit(SignalingEvents.ANSWER, { description, from: socket.id });
-      logger.info(`Relayed ANSWER from ${socket.id} to room ${roomId}`);
+      io.to(to).emit(SignalingEvents.ANSWER, { from: socket.id, answer });
+      logger.info(`Relayed ANSWER from ${socket.id} → ${to}`);
     });
 
     // --- ICE CANDIDATE ---
-    socket.on(SignalingEvents.ICE_CANDIDATE, ({ roomId, candidate }) => {
-      if (!roomId || !candidate) {
+    socket.on(SignalingEvents.ICE_CANDIDATE, ({ to, candidate }) => {
+      if (!to || !candidate) {
         socket.emit(SignalingEvents.ERROR, {
-          message: "ICE candidate requires roomId & candidate",
+          message: "ICE candidate requires to & candidate",
         });
         return;
       }
-      socket
-        .to(roomId)
-        .emit(SignalingEvents.ICE_CANDIDATE, { candidate, from: socket.id });
+      io.to(to).emit(SignalingEvents.ICE_CANDIDATE, {
+        from: socket.id,
+        candidate,
+      });
+      logger.info(`Relayed ICE candidate from ${socket.id} → ${to}`);
     });
 
     // --- DISCONNECT ---
@@ -155,7 +169,7 @@ export const initSignaling = (server: HttpServer) => {
         rooms[roomId] = (rooms[roomId] || []).filter((u) => u.id !== socket.id);
 
         socket.to(roomId).emit(SignalingEvents.PARTICIPANT_LEFT, {
-          socketId: socket.id,
+          id: socket.id,
         });
       }
     });
